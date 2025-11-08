@@ -1,46 +1,77 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-import io, os, pandas as pd
-from . import ml as mlmod
+from pydantic import BaseModel
+import pandas as pd
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score
+import numpy as np
 
-app = FastAPI(title="Sleep Health API")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=True
 )
 
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-@app.post("/predict")
-async def predict(payload: dict):
-    try:
-        required = ["daily_social_media_minutes","gaming_hours_per_week","introversion_extraversion"]
-        if not all(k in payload for k in required):
-            raise ValueError("Required keys missing")
-        pred = mlmod.predict_one(payload)
-        return {"predicted_sleep_hours": float(pred)}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+model = None
 
 @app.post("/train")
-async def train(csv_file: UploadFile = File(...)):
+async def train(file: UploadFile = File(...)):
+    global model
     try:
-        df = pd.read_csv(io.BytesIO(await csv_file.read()))
-        res = mlmod.train_model_from_df(df)
-        return JSONResponse(res)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        df = pd.read_csv(file.file)
 
-@app.get("/download-model")
-async def download_model():
-    p = os.path.join(os.path.dirname(__file__), "models", "sleep_model.joblib")
-    if not os.path.exists(p):
-        raise HTTPException(status_code=404, detail="model not found")
-    return FileResponse(p, filename="sleep_model.joblib")
+        X = df[['Daily social media minutes', 'Gaming hours per week', 'Personality (introvert/extrovert)']]
+        y = df['Sleep hours']
+
+        X['Personality (introvert/extrovert)'] = X['Personality (introvert/extrovert)'].map({'introvert': 0, 'extrovert': 1})
+
+        model = LinearRegression()
+        model.fit(X, y)
+
+        preds = model.predict(X)
+        rmse = np.sqrt(mean_squared_error(y, preds))
+        r2 = r2_score(y, preds)
+
+        return {"rmse": float(rmse), "r2": float(r2)}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+class PredictionInput(BaseModel):
+    daily_social_media_minutes: float
+    gaming_hours_per_week: float
+    introversion_extraversion: str
+
+@app.post("/predict")
+async def predict(data: PredictionInput):
+    global model
+    if model is None:
+        return {"error": "Model not trained yet. Please train the model first."}
+
+    try:
+        personality_encoded = 0 if data.introversion_extraversion.lower() == "introvert" else 1
+
+        X_new = pd.DataFrame([[
+            data.daily_social_media_minutes,
+            data.gaming_hours_per_week,
+            personality_encoded
+        ]], columns=[
+            'Daily social media minutes',
+            'Gaming hours per week',
+            'Personality (introvert/extrovert)'
+        ])
+
+        pred = model.predict(X_new)[0]
+        return {"predicted_sleep_hours": float(pred)}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/health")
+def health():
+    return {"status": "Backend running fine!"}
+
